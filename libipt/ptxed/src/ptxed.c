@@ -176,6 +176,108 @@ struct ptxed_stats {
 	uint32_t flags;
 };
 
+
+
+
+//
+// DRCOV output
+//
+
+#pragma pack(push, 1)
+typedef struct drcov_bb {
+	uint32_t start;
+	uint16_t size;
+	uint16_t id;
+} drcov_bb;
+#pragma pack(pop)
+
+typedef struct drcov_ListItem {
+	drcov_bb block;
+	struct drcov_ListItem * pNext;
+} drcov_ListItem;
+
+drcov_ListItem* g_pFirstCoverageBlock = NULL;
+int g_nCoverageBlockCount = 0;
+
+char* g_strRawFileName = "SMRAM_dump_cb000000_cb7fffff.bin";
+uint16_t g_nSMM_id = 0;
+uint64_t g_nSMM_base = 0x00000000cb000000;
+uint64_t g_nSMM_end = 0x00000000cb800000;
+
+
+static void add_drcov(const struct pt_block *block, int last_instr_len) {
+	if (block->ip >= g_nSMM_base && block->ip < g_nSMM_end) {
+		uint32_t block_start = block->ip - g_nSMM_base;
+		uint32_t block_size = block->end_ip - block->ip + last_instr_len;
+		drcov_ListItem* pItem = g_pFirstCoverageBlock;
+		while (pItem) {
+			if (pItem->block.start == block_start && pItem->block.size == block_size)
+				return;
+			if (pItem->pNext == NULL)
+				break;
+			pItem = pItem->pNext;
+		}
+		// pItem = last_item OR NULL
+
+		drcov_ListItem* pNewItem = malloc(sizeof(drcov_ListItem));
+		pNewItem->block.id = g_nSMM_id;
+		pNewItem->block.start = block_start;
+		pNewItem->block.size = block_size;
+		pNewItem->pNext = NULL;
+
+		if (pItem)
+			pItem->pNext = pNewItem;
+		else
+			g_pFirstCoverageBlock = pNewItem;
+
+		g_nCoverageBlockCount++;
+
+		printf("[DRCOV] Saved block start=%llx end=%llx\n", block->ip, block->end_ip + last_instr_len);
+	}
+}
+
+static void save_drcov() {
+	uint64_t smm_entry = g_nSMM_base; // any address inside module
+	uint32_t checksum = 0xDEADC0DE;
+	uint32_t timestamp = 0xDEADC0DE;
+	char g_strDrcovFileName[_MAX_PATH];
+	strcpy_s(g_strDrcovFileName, sizeof(g_strDrcovFileName), g_strRawFileName);
+	strcat_s(g_strDrcovFileName, sizeof(g_strDrcovFileName), ".log");
+
+	char* pFileName = g_strRawFileName;
+	for (int i = 0; i < strlen(g_strRawFileName); i++) {
+		if (g_strRawFileName[i] == '\\' || g_strRawFileName[i] == '/')
+			pFileName = &g_strRawFileName[i + 1];
+	}
+
+	FILE* cov_file = fopen(g_strDrcovFileName, "wb");
+	if (cov_file) {
+		fputs("DRCOV VERSION: 2\n", cov_file);
+		fputs("DRCOV FLAVOR: drcov\n", cov_file);
+		fputs("Module Table: version 2, count 1\n", cov_file);
+		fputs("Columns: id, base, end, entry, checksum, timestamp, path\n", cov_file);
+		fprintf(cov_file, "   %i, 0x%08llx, 0x%08llx, 0x%08llx, 0x%08x, 0x%08x, %s\n", g_nSMM_id, g_nSMM_base, g_nSMM_end, smm_entry, checksum, timestamp, pFileName);
+		fprintf(cov_file, "BB Table: %i bbs\n", g_nCoverageBlockCount);
+		drcov_ListItem* pItem = g_pFirstCoverageBlock;
+		while (pItem) {
+			drcov_ListItem* pPrev = pItem;
+			fwrite(&pItem->block, 1, sizeof(pItem->block), cov_file);
+			pItem = pItem->pNext;
+			free(pPrev);
+		}
+		fclose(cov_file);
+		g_pFirstCoverageBlock = NULL;
+	} else {
+		printf("[DRCOV] Failed to open coverage output file %s\n", g_strDrcovFileName);
+	}
+}
+
+//
+// DRCOV output END
+//
+
+
+
 static int ptxed_have_decoder(const struct ptxed_decoder *decoder)
 {
 	/* It suffices to check for one decoder in the variant union. */
@@ -591,6 +693,14 @@ static int load_raw(struct pt_image_section_cache *iscache,
 			prog, arg, base, pt_errstr(pt_errcode(errcode)));
 		return -1;
 	}
+
+	g_strRawFileName = arg;
+	g_nSMM_base = base;
+	g_nSMM_end = base + 0x800000; // can we hardcode smram size?
+
+	printf("[DRCOV] g_strRawFileName = %s\n", g_strRawFileName);
+	printf("[DRCOV] g_nSMM_base = %llx\n", g_nSMM_base);
+	printf("[DRCOV] g_nSMM_end = %llx\n", g_nSMM_end);
 
 	return 0;
 }
@@ -1531,15 +1641,16 @@ static void print_block(struct ptxed_decoder *decoder,
 		printf("]\n");
 	}
 
+	ip = block->ip;
 	mode = translate_mode(block->mode);
 	xed_state_init2(&xed, mode, XED_ADDRESS_WIDTH_INVALID);
-
 	/* There's nothing to do for empty blocks. */
 	ninsn = block->ninsn;
 	if (!ninsn)
 		return;
 
-	ip = block->ip;
+	int last_instr_len = 0;
+
 	for (;;) {
 		struct pt_insn insn;
 		xed_decoded_inst_t inst;
@@ -1577,7 +1688,7 @@ static void print_block(struct ptxed_decoder *decoder,
 
 		if (!options->dont_print_insn)
 			xed_print_insn(&inst, insn.ip, options);
-
+		last_instr_len = inst._decoded_length;
 		printf("\n");
 
 		ninsn -= 1;
@@ -1590,6 +1701,9 @@ static void print_block(struct ptxed_decoder *decoder,
 			break;
 		}
 	}
+
+
+	add_drcov(block, last_instr_len);
 
 	/* Decode should have brought us to @block->end_ip. */
 	if (ip != block->end_ip)
@@ -1823,6 +1937,8 @@ static void decode_block(struct ptxed_decoder *decoder,
 
 		diagnose_block(decoder, "error", status, &block);
 	}
+
+	save_drcov();
 }
 
 static void decode(struct ptxed_decoder *decoder,

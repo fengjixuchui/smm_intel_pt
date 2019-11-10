@@ -3091,8 +3091,8 @@ static int pt_blk_process_enabled(struct pt_block_decoder *decoder,
 		return -pte_noip;
 
 	/* We must currently be disabled. */
-	if (decoder->enabled)
-		return -pte_bad_context;
+	//if (decoder->enabled)
+	//	return -pte_bad_context;
 
 	decoder->ip = ev->variant.enabled.ip;
 	decoder->enabled = 1;
